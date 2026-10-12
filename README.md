@@ -268,7 +268,7 @@ Kart üzerindeki **BOOT** butonu (`GPIO0`) ve LED (`GPIO2`) kullanılır. Çıpl
 
 | Basma süresi | İşlev | LED |
 |---|---|---|
-| Kısa (< 2 sn) | Kombi rölesini test için açar/kapatır | — |
+| Kısa (< 2 sn) | Kombi rölesini test için açar/kapatır (HA'daki **Kombi Rölesi** ile aynı koruma kuralları geçerlidir, bkz. [Pano Kartı](#pano-kartı)) | — |
 | 5–10 sn | Wi-Fi ayarlarını siler, kurulum ağını açar | 5. saniyeden sonra hızlı yanıp söner |
 | 10–30 sn | Fabrika ayarlarına döner (tüm ayarlar ve API anahtarı silinir) | 10. saniyeden sonra sabit yanar |
 
