@@ -211,7 +211,7 @@ binary_sensor:
         max_length: 2000ms
         then:
           - logger.log: "Boot butonuna basıldı: Röle toggle ediliyor (Test - koruma süreleri geçerlidir)"
-          - switch.toggle: kombi_role
+          - switch.toggle: kombi_role_manuel
       - min_length: 5000ms
         max_length: 9999ms
         then:
@@ -448,15 +448,15 @@ script:
 
 # ==============================================================================
 # KOMBİ RÖLESİ
-# Röle hangi kaynaktan değişirse değişsin (motor, HA, buton) zaman damgası burada
-# tutulur; böylece manuel müdahaleler de kombi koruma sürelerine dahil edilir.
+# Fiziksel röle yalnızca termostat motoru tarafından doğrudan sürülür; zaman damgaları
+# burada tutulur. HA ve BOOT butonu röleyi "Kombi Rölesi" anahtarı üzerinden değiştirir;
+# bu anahtar kombi koruma sürelerine uymayan istekleri reddeder.
 # ==============================================================================
 switch:
   - platform: gpio
     id: kombi_role
     pin: GPIO13
-    name: "Kombi Rölesi"
-    icon: "mdi:radiator"
+    internal: true
     restore_mode: ALWAYS_OFF
     on_turn_on:
       - lambda: |-
@@ -467,6 +467,45 @@ switch:
           id(last_relay_off_time) = millis();
           id(donma_acil) = false;
           ESP_LOGI("role", "Kombi rölesi KAPANDI");
+
+  # Elle kumanda (test). Kabul edilen istekten sonra motor yine kendi kararını uygular:
+  # gerek yokken açılan kombi minimum çalışma süresi dolunca söner, gerekliyken kapatılan
+  # kombi minimum bekleme süresi dolunca yeniden yanar.
+  - platform: template
+    id: kombi_role_manuel
+    name: "Kombi Rölesi"
+    icon: "mdi:radiator"
+    lambda: "return id(kombi_role).state;"
+    turn_on_action:
+      - lambda: |-
+          if (id(kombi_role).state)
+            return;
+          const uint32_t min_off_ms = (uint32_t) (id(min_bekleme_suresi).state * 60000.0f);
+          const uint32_t kapali_sure = millis() - id(last_relay_off_time);
+          if (id(termostat_modu).state == "Kapalı") {
+            ESP_LOGW("role", "Elle açma reddedildi: termostat 'Kapalı' modunda");
+          } else if (!id(sensor_ok)) {
+            ESP_LOGW("role", "Elle açma reddedildi: sensör verisi yok");
+          } else if (kapali_sure < min_off_ms) {
+            ESP_LOGW("role", "Elle açma reddedildi: dinlenme koruması (%u sn kaldı)",
+                     (unsigned) ((min_off_ms - kapali_sure) / 1000));
+          } else {
+            id(kombi_role).turn_on();
+          }
+          id(kombi_role_manuel).publish_state(id(kombi_role).state);
+    turn_off_action:
+      - lambda: |-
+          if (!id(kombi_role).state)
+            return;
+          const uint32_t min_on_ms = (uint32_t) (id(min_calisma_suresi).state * 60000.0f);
+          const uint32_t acik_sure = millis() - id(last_relay_on_time);
+          if (acik_sure < min_on_ms) {
+            ESP_LOGW("role", "Elle kapatma reddedildi: minimum çalışma koruması (%u sn kaldı)",
+                     (unsigned) ((min_on_ms - acik_sure) / 1000));
+          } else {
+            id(kombi_role).turn_off();
+          }
+          id(kombi_role_manuel).publish_state(id(kombi_role).state);
 
 # ==============================================================================
 # BLE TARAYICI

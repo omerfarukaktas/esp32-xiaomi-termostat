@@ -67,6 +67,15 @@ struct Relay {
 #include "off.inc"
   }
 } kombi_role;
+Entity<bool> kombi_role_manuel;
+
+// HA / BOOT butonu üzerinden elle kumanda ("Kombi Rölesi" anahtarı)
+void manuel_ac() {
+#include "manuel_on.inc"
+}
+void manuel_kapat() {
+#include "manuel_off.inc"
+}
 
 void kontrol() {
 #include "kontrol.inc"
@@ -197,7 +206,40 @@ int main(int argc, char **argv) {
   run(6 * 60, NAN);
   expect(sensor_timeout_alert.state && !kombi_role.state, "35 dk sonra emniyet kapatması");
 
-  puts("13) MAC / BindKey doğrulama");
+  puts("13) Elle kumanda (HA / BOOT butonu) koruma sürelerine uyar");
+  manuel_ac();
+  expect(!kombi_role.state, "sensör verisi yokken elle açma reddedildi");
+  run(20, 23.0);
+  manuel_ac();
+  expect(!kombi_role.state, "emniyet kapatmasından sonra dinlenme süresi dolmadan reddedildi");
+  run(180, 23.0);
+  manuel_ac();
+  expect(kombi_role.state, "dinlenme süresi dolmuşsa elle açıldı");
+  expect(kombi_role_manuel.state, "anahtar durumu röleyle aynı");
+  manuel_kapat();
+  expect(kombi_role.state, "minimum çalışma dolmadan elle kapatma reddedildi");
+  run(170, 23.0);
+  expect(kombi_role.state, "hedef aşılmış, minimum çalışma bekleniyor");
+  run(20, 23.0);
+  expect(!kombi_role.state, "minimum çalışma dolunca motor kapattı");
+  manuel_ac();
+  expect(!kombi_role.state && !kombi_role_manuel.state, "dinlenme süresi dolmadan elle açma reddedildi");
+  run(200, 23.0);
+  termostat_modu.state = "Kapalı";
+  manuel_ac();
+  expect(!kombi_role.state, "'Kapalı' modda elle açma reddedildi");
+  termostat_modu.state = "Manuel Sabit Hedef";
+  run(200, 20.0);
+  expect(kombi_role.state, "oda soğukken motor yaktı");
+  run(200, 20.0);
+  manuel_kapat();
+  expect(!kombi_role.state, "minimum çalışma dolduktan sonra elle kapatıldı");
+  run(30, 20.0);
+  expect(!kombi_role.state && starts(calisma_durumu.state, "Dinlenme"), "elle kapatma sonrası dinlenme bekleniyor");
+  run(180, 20.0);
+  expect(kombi_role.state, "dinlenme sonrası motor yeniden yaktı");
+
+  puts("14) MAC / BindKey doğrulama");
   uint64_t mac = 0;
   expect(termostat_parse_mac("A4:C1:38:C5:0D:5D", mac) && mac == 0xA4C138C50D5DULL, "geçerli MAC");
   expect(termostat_parse_mac("a4:c1:38:c5:0d:5d", mac), "küçük harf MAC");

@@ -38,6 +38,7 @@ def main():
     config = yaml.load((ROOT / "termostat.yaml").read_text(encoding="utf-8"), Loader=Loader)
     scripts = {s["id"]: s for s in config["script"]}
     relay = next(s for s in config["switch"] if s["id"] == "kombi_role")
+    manuel = next(s for s in config["switch"] if s["id"] == "kombi_role_manuel")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = pathlib.Path(tmp)
@@ -45,6 +46,8 @@ def main():
         (tmp / "veri.inc").write_text(lambda_of(scripts["sensor_veri_alindi"]["then"]), encoding="utf-8")
         (tmp / "on.inc").write_text(lambda_of(relay["on_turn_on"]), encoding="utf-8")
         (tmp / "off.inc").write_text(lambda_of(relay["on_turn_off"]), encoding="utf-8")
+        (tmp / "manuel_on.inc").write_text(lambda_of(manuel["turn_on_action"]), encoding="utf-8")
+        (tmp / "manuel_off.inc").write_text(lambda_of(manuel["turn_off_action"]), encoding="utf-8")
 
         binary = tmp / "engine_test"
         build = subprocess.run(

@@ -194,7 +194,7 @@ Belirli bir süre geçerli sıcaklık verisi gelmezse kombi minimum çalışma s
 | Xiaomi Sensör MAC Adresi | `AA:BB:CC:DD:EE:FF` |
 | Xiaomi BindKey | 32 hex karakter, yalnızca yazılabilir |
 | OTA Güncelleme Şifresi | en az 8 karakter, yalnızca yazılabilir |
-| Kombi Rölesi | Test amaçlı; termostat kontrolü korumalara uyarak geri alır |
+| Kombi Rölesi | Test amaçlı elle kumanda; koruma sürelerine uymayan istek reddedilir, termostat kontrolü sonra kendi kararını uygular |
 
 Tüm ayarlar cihazın flash belleğinde saklanır ve yeniden başlatmada korunur.
 </details>
@@ -256,7 +256,9 @@ Mevcut bir panoya eklemek isterseniz dosyadaki `cards:` altındaki dört kartı 
 > Dosyadaki varlık adları (`sensor.esp32_xiaomi_termostat_oda_sicakligi` gibi), cihaz Home Assistant'a **ESP32 Xiaomi Termostat** adıyla ilk kez eklendiğinde oluşan adlardır. Cihazı daha önce başka bir adla eklediyseniz veya bir alana (oda) atadıysanız adlar farklı olabilir; kartta "Varlık bulunamadı" görürseniz **Ayarlar → Varlıklar** sayfasından gerçek adları bulup dosyadaki `esp32_xiaomi_termostat_` önekini kendi önekinizle değiştirin.
 
 > [!TIP]
-> **Kombi** satırına dokunmak röleyi elle açıp kapatır. Bu yalnızca test içindir; termostat motoru röleyi kombi koruma sürelerine uyarak (örn. elle açılan kombi, minimum çalışma süresi dolunca) kendi kararına göre geri alır.
+> **Kombi** satırına dokunmak (veya BOOT butonuna kısa basmak) röleyi elle açıp kapatır. Bu yalnızca test içindir:
+> - Minimum bekleme süresi dolmadan, sensör verisi yokken veya *Kapalı* modda açma isteği; minimum çalışma süresi dolmadan kapatma isteği **reddedilir** (anahtar eski durumuna döner, sebebi loglanır).
+> - Kabul edilen istekten sonra termostat yine kendi kararını uygular: gerek yokken açılan kombi minimum çalışma süresi dolunca söner, gerekliyken kapatılan kombi minimum bekleme süresi dolunca yeniden yanar.
 
 ## Buton ve LED
 
