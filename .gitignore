@@ -1,0 +1,21 @@
+# ESPHome derleme çıktıları
+/.esphome/
+/dist/
+
+# Derlenmiş firmware dosyaları GitHub Releases üzerinden dağıtılır
+*.bin
+
+# Yerel gizli değerler (bu proje gerektirmez, yine de güvenlik için)
+secrets.yaml
+homeassistant.txt
+
+# Yerel yedekler
+/.yedek_v1/
+
+# Python / editör
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+.DS_Store

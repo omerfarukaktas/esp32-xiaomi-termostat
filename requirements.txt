@@ -1,0 +1,3 @@
+# CI ve yerel derleme bağımlılıkları (sürüm burada sabitlenir)
+esphome==2025.9.3
+pyyaml

@@ -1,0 +1,1017 @@
+# ==============================================================================
+# ESP32 Xiaomi Termostat
+# Xiaomi BLE sıcaklık sensörü (PVVX veya orijinal firmware) ile çalışan,
+# kararlarını tamamen ESP32 üzerinde veren, Home Assistant ile yönetilen kombi termostatı.
+#
+# BindKey ve OTA şifresi Home Assistant arayüzünden girilir.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+# ==============================================================================
+substitutions:
+  name: esp32-xiaomi-termostat
+  friendly_name: "ESP32 Xiaomi Termostat"
+  # Sürüm release iş akışında otomatik verilir:
+  #   esphome -s version 1.2.0 -s github_owner omerfarukaktas compile termostat.yaml
+  version: "dev"
+  github_owner: "omerfarukaktas"
+  # Yalnızca ilk kurulum varsayılanı; gerçek adres HA'daki "Xiaomi Sensör MAC Adresi" alanından girilir.
+  xiaomi_mac_default: "A4:C1:38:00:00:01"
+  # Yalnızca varsayılan saat dilimi: cihaz Home Assistant'a bağlandığında HA'nın saat
+  # dilimini otomatik alır ve saklar. Bu değer, HA'ya hiç bağlanılmamışsa kullanılır.
+  timezone: "Europe/Istanbul"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: "Xiaomi BLE sensörlü otonom kombi termostatı"
+  project:
+    name: ${github_owner}.esp32-xiaomi-termostat
+    version: ${version}
+  includes:
+    - include/termostat_helpers.h
+  on_boot:
+    - priority: 600.0
+      then:
+        - logger.log: "Boot: Güvenlik kontrolü - Kombi rölesi başlangıçta OFF"
+        - switch.turn_off: kombi_role
+        # Yeniden başlatma da bir "kapanma" sayılır: güç kesintisi / reset döngülerinde
+        # kombinin kısa aralıklarla yakılmasını önlemek için bekleme süresi açılıştan başlar.
+        - lambda: |-
+            id(last_relay_off_time) = millis();
+            id(last_sensor_seen) = millis();
+    - priority: -100.0
+      then:
+        # HA'dan girilip flash'ta saklanan ayarları uygula
+        - lambda: |-
+            uint64_t mac;
+            const std::string &kayitli = id(xiaomi_mac_input).state;
+            if (termostat_parse_mac(kayitli, mac)) {
+              id(pvvx_sensor).set_address(mac);
+              id(stok_sensor).set_address(mac);
+              ESP_LOGI("mac", "Xiaomi sensör MAC adresi: %s", kayitli.c_str());
+            } else {
+              ESP_LOGW("mac", "Kayıtlı MAC geçersiz ('%s'); HA'dan sensör MAC adresini girin", kayitli.c_str());
+            }
+            if (!id(xiaomi_bindkey).empty()) {
+              id(stok_sensor).set_bindkey(id(xiaomi_bindkey));
+              id(bindkey_input).publish_state(TERMOSTAT_MASKE);
+            }
+            if (!id(ota_sifresi).empty()) {
+              id(esphome_ota).set_auth_password(id(ota_sifresi));
+              id(ota_sifre_input).publish_state(TERMOSTAT_MASKE);
+            } else {
+              ESP_LOGW("ota", "OTA şifresi tanımlı değil! HA'da 'OTA Güncelleme Şifresi' alanından belirleyin.");
+            }
+            if (!id(ha_saat_dilimi).empty()) {
+              id(my_time).set_timezone(id(ha_saat_dilimi));
+              id(ha_time).set_timezone(id(ha_saat_dilimi));
+              ESP_LOGI("time", "Kayıtlı saat dilimi (HA'dan): %s", id(ha_saat_dilimi).c_str());
+            }
+            id(motor_hazir) = true;
+        - script.execute: termostat_kontrol
+        # Wi-Fi'ye hiç bağlanılamazsa (modem kapalı, şifre yanlış vb.) BLE yine de açılır;
+        # termostat Wi-Fi'den bağımsız çalışmaya devam eder.
+        - delay: 60s
+        - ble.enable:
+
+esp32:
+  board: esp32dev
+  framework:
+    # ESP-IDF: BLE için ESPHome'un önerdiği framework.
+    type: esp-idf
+  # 4MB flash: 2 x 1.94MB OTA bölümü (bkz. partitions.csv)
+  partitions: partitions.csv
+
+logger:
+  level: INFO
+  logs:
+    component: ERROR
+
+# ==============================================================================
+# WI-FI & KURULUM
+# Kayıtlı ağ yoksa veya 1 dk bağlanılamazsa açık 'Termostat-Kurulum' ağı ve captive
+# portal açılır. Bu sırada ev ağına bağlanmayı denemeye devam eder; bu yüzden
+# reboot_timeout gerekmez.
+# ==============================================================================
+esp32_ble:
+  # Wi-Fi ilk bağlantısının kararlı olması için BLE, Wi-Fi bağlandığında (veya en geç
+  # açılıştan 60 sn sonra) açılır ve bir daha KAPATILMAZ.
+  enable_on_boot: false
+
+wifi:
+  on_connect:
+    then:
+      - ble.enable:
+  ap:
+    ssid: "Termostat-Kurulum"
+    ap_timeout: 1min
+
+captive_portal:
+
+improv_serial:
+
+# Home Assistant Yerel API Bağlantısı
+api:
+  reboot_timeout: 0s
+  # Şifreleme anahtarı koda yazılmaz: Home Assistant cihazı eklerken anahtarı üretip cihaza
+  # gönderir; anahtar NVS'te saklanır ve sonrasında şifresiz bağlantı kapanır.
+  encryption: {}
+  actions:
+    # HA otomasyonları için: manuel hedefi ayarlar ve "Manuel Sabit Hedef" moduna geçer
+    - action: set_target_temperature
+      variables:
+        target: float
+      then:
+        - lambda: |-
+            auto *n = id(manuel_hedef_sicaklik);
+            if (std::isnan(target)) {
+              ESP_LOGW("api", "Geçersiz hedef sıcaklık (NaN) reddedildi");
+              return;
+            }
+            float v = std::max(n->traits.get_min_value(), std::min(n->traits.get_max_value(), target));
+            if (v != target)
+              ESP_LOGW("api", "Hedef %.1f °C izin verilen aralık dışında, %.1f °C'ye sınırlandı", target, v);
+            n->make_call().set_value(v).perform();
+            id(termostat_modu).make_call().set_option("Manuel Sabit Hedef").perform();
+    - action: set_hysteresis
+      variables:
+        h: float
+      then:
+        - lambda: |-
+            auto *n = id(histerezis_toleransi);
+            if (std::isnan(h)) {
+              ESP_LOGW("api", "Geçersiz histerezis (NaN) reddedildi");
+              return;
+            }
+            float v = std::max(n->traits.get_min_value(), std::min(n->traits.get_max_value(), h));
+            n->make_call().set_value(v).perform();
+    # Sensör MAC adresini servis üzerinden değiştirme
+    - action: set_xiaomi_mac
+      variables:
+        mac: string
+      then:
+        - lambda: |-
+            uint64_t parsed;
+            std::string norm = termostat_upper(mac);
+            if (!termostat_parse_mac(norm, parsed)) {
+              ESP_LOGW("api", "Geçersiz MAC reddedildi: '%s' (Örnek: A4:C1:38:C5:0D:5D)", mac.c_str());
+              return;
+            }
+            id(xiaomi_mac_input).make_call().set_value(norm).perform();
+
+# ==============================================================================
+# GÜNCELLEME (OTA)
+# ESPHome/HA panelinden yerel ağ üzerinden yükleme. Şifre koda yazılmaz;
+# HA'daki "OTA Güncelleme Şifresi" alanından belirlenir ve flash'ta saklanır.
+# ==============================================================================
+ota:
+  - platform: esphome
+    id: esphome_ota
+    # Boş = derlemede şifre yok; gerçek şifre açılışta flash'tan yüklenir.
+    password: ""
+
+# Saat: önce SNTP, internet yoksa Home Assistant üzerinden senkronize edilir.
+# İkisi de sistem saatini ayarlar; id(my_time).now() hangisi geçerliyse onu döndürür.
+# Saat dilimi: Home Assistant kendi saat dilimini cihaza gönderir; bu dilim SNTP'ye de
+# uygulanır ve flash'ta saklanır (HA'ya hiç bağlanılmadıysa ${timezone} kullanılır).
+time:
+  - platform: sntp
+    id: my_time
+    timezone: ${timezone}
+  - platform: homeassistant
+    id: ha_time
+    timezone: ${timezone}
+
+# ==============================================================================
+# FİZİKSEL BUTON (BOOT / GPIO 0) & DURUM LEDİ (GPIO 2)
+# ==============================================================================
+output:
+  - platform: gpio
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true   # Kart üzerindeki yerleşik LED
+    id: led_gpio
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO0
+      ignore_strapping_warning: true   # Kart üzerindeki yerleşik BOOT butonu
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Cihaz Fiziksel Butonu"
+    id: boot_button
+    on_press:
+      - script.execute: button_hold_feedback
+    on_release:
+      - script.stop: button_hold_feedback
+      - output.turn_off: led_gpio
+    on_click:
+      - min_length: 50ms
+        max_length: 2000ms
+        then:
+          - logger.log: "Boot butonuna basıldı: Röle toggle ediliyor (Test - koruma süreleri geçerlidir)"
+          - switch.toggle: kombi_role
+      - min_length: 5000ms
+        max_length: 9999ms
+        then:
+          - logger.log: "5sn tamamlandı: WiFi ayarları temizleniyor ve Cihaz Kurulum Moduna Alınıyor..."
+          - lambda: |-
+              wifi::global_wifi_component->save_wifi_sta("", "");
+          - delay: 500ms
+          - button.press: yeniden_baslat
+      - min_length: 10000ms
+        max_length: 30000ms
+        then:
+          - logger.log: "10sn tamamlandı: Tam Fabrika Ayarlarına Sıfırlama Yapılıyor..."
+          - button.press: fabrika_ayarlari
+
+  - platform: template
+    name: "Sensör Bağlantı Uyarısı"
+    id: sensor_timeout_alert
+    device_class: problem
+    entity_category: diagnostic
+
+script:
+  # Butona basılı tutulduğunda kullanıcıya gerçek zamanlı görsel sayaç gösterir
+  - id: button_hold_feedback
+    mode: restart
+    then:
+      # 1. - 5. saniye: saniyede bir yanıp söner
+      - repeat:
+          count: 5
+          then:
+            - output.turn_on: led_gpio
+            - delay: 150ms
+            - output.turn_off: led_gpio
+            - delay: 850ms
+      # 5. saniye: hızlı yanıp söner (bırakılırsa Wi-Fi sıfırlanır)
+      - repeat:
+          count: 25
+          then:
+            - output.turn_on: led_gpio
+            - delay: 100ms
+            - output.turn_off: led_gpio
+            - delay: 100ms
+      # 10. saniye: sabit yanar (bırakılırsa fabrika ayarlarına döner)
+      - output.turn_on: led_gpio
+
+  # Her iki sensör platformu da her yeni sıcaklık okumasında bu script'i çağırır.
+  # Filtrelerden ÖNCE çağrıldığı için sabit sıcaklıkta da "canlılık" sinyali üretir.
+  - id: sensor_veri_alindi
+    mode: queued
+    max_runs: 3
+    parameters:
+      t: float
+      stok: bool
+    then:
+      - lambda: |-
+          // Mantıksız değerleri (bozuk paket, pil bitmek üzere vb.) kontrol döngüsüne sokma
+          if (std::isnan(t) || t < -30.0f || t > 70.0f) {
+            ESP_LOGW("sensor", "Geçersiz sıcaklık okuması yok sayıldı: %.2f", t);
+            return;
+          }
+          id(last_sensor_seen) = millis();
+          id(son_ham_sicaklik) = t;
+          if (!id(sensor_tipi).has_state() || id(sensor_stok) != stok) {
+            id(sensor_stok) = stok;
+            id(sensor_tipi).publish_state(stok ? "Orijinal Xiaomi (BindKey)" : "PVVX");
+          }
+          if (!id(sensor_ok)) {
+            id(sensor_ok) = true;
+            ESP_LOGI("sensor", "Xiaomi sensöründen veri alındı: %.2f °C", t);
+          }
+          if (!id(sensor_timeout_alert).has_state() || id(sensor_timeout_alert).state)
+            id(sensor_timeout_alert).publish_state(false);
+          id(room_temp).publish_state(t);
+
+  - id: termostat_kontrol
+    mode: single
+    then:
+      - lambda: |-
+          // Kapalı modunda acil donma koruması eşikleri
+          static const float KAPALI_DONMA_AC = 5.0f;
+          static const float KAPALI_DONMA_KAPAT = 7.0f;
+          // Sensör zaman aşımı: PVVX birkaç saniyede bir, orijinal firmware ~10 dk'da bir
+          // yayın yapar. Açılıştan beri hiç veri gelmediyse 20 dk beklenir.
+          const uint32_t timeout_dk = std::isnan(id(son_ham_sicaklik)) ? 20 : (id(sensor_stok) ? 35 : 15);
+          const uint32_t SENSOR_TIMEOUT_MS = timeout_dk * 60UL * 1000UL;
+
+          // Tüm bileşenler kurulmadan (NVS'den ayarlar yüklenirken) kontrol çalışmaz.
+          if (!id(motor_hazir))
+            return;
+          const uint32_t now_ms = millis();
+
+          auto set_status = [](const std::string &s) {
+            if (!id(calisma_durumu).has_state() || id(calisma_durumu).state != s)
+              id(calisma_durumu).publish_state(s);
+          };
+          auto set_dilim = [](const std::string &s) {
+            if (!id(aktif_program_dilimi).has_state() || id(aktif_program_dilimi).state != s)
+              id(aktif_program_dilimi).publish_state(s);
+          };
+          auto set_hedef = [](float v) {
+            float cur = id(aktif_hedef_temp).state;
+            bool changed = std::isnan(v) != std::isnan(cur) || (!std::isnan(v) && fabsf(v - cur) > 0.01f);
+            if (!id(aktif_hedef_temp).has_state() || changed)
+              id(aktif_hedef_temp).publish_state(v);
+          };
+
+          // ------------------------------------------------------------------
+          // 1. Mod ve hedef sıcaklık
+          // ------------------------------------------------------------------
+          const std::string &mod = id(termostat_modu).state;
+          const bool kapali = (mod == "Kapalı");
+          float hedef = NAN;
+
+          if (kapali) {
+            set_dilim("Kapalı");
+          } else if (mod == "Donma Koruması") {
+            hedef = id(donma_koruma_sicakligi).state;
+            set_dilim("Donma Koruması (Tatil)");
+          } else if (mod == "Manuel Sabit Hedef") {
+            hedef = id(manuel_hedef_sicaklik).state;
+            set_dilim("Manuel Sabit Hedef");
+          } else {
+            // "Zaman Dilimi Programı (Otomatik)" - 4 zaman dilimli takvim motoru
+            auto zaman = id(my_time).now();
+            if (!zaman.is_valid()) {
+              // Saat henüz senkronize değil (internet/HA yok): rastgele bir dilim seçmek yerine
+              // kullanıcının manuel hedefini güvenli varsayılan olarak kullan.
+              hedef = id(manuel_hedef_sicaklik).state;
+              set_dilim("Saat senkronize değil -> Manuel hedef");
+            } else {
+              struct TimePoint {
+                int hour;
+                float temp;
+                const char *name;
+              };
+              TimePoint slots[4] = {
+                {(int) id(sabah_saat).state, id(sabah_hedef).state, "Sabah (Uyanma)"},
+                {(int) id(gunduz_saat).state, id(gunduz_hedef).state, "Gündüz (Ekonomi)"},
+                {(int) id(aksam_saat).state, id(aksam_hedef).state, "Akşam (Konfor)"},
+                {(int) id(gece_saat).state, id(gece_hedef).state, "Gece (Uyku)"},
+              };
+              std::stable_sort(slots, slots + 4, [](const TimePoint &a, const TimePoint &b) { return a.hour < b.hour; });
+
+              // Mevcut saatten önce başlayan son dilim; yoksa önceki günün son dilimi devam eder.
+              const TimePoint *aktif = &slots[3];
+              for (auto &s : slots) {
+                if (zaman.hour >= s.hour)
+                  aktif = &s;
+              }
+              hedef = aktif->temp;
+              char buf[64];
+              snprintf(buf, sizeof(buf), "%s -> Hedef: %.1f°C", aktif->name, hedef);
+              set_dilim(buf);
+            }
+          }
+          set_hedef(hedef);
+
+          // ------------------------------------------------------------------
+          // 2. Sensör emniyet bekçisi (açılıştan beri hiç veri gelmemesi de dahil)
+          // ------------------------------------------------------------------
+          if (now_ms - id(last_sensor_seen) > SENSOR_TIMEOUT_MS) {
+            if (id(sensor_ok) || !id(sensor_timeout_alert).has_state() || !id(sensor_timeout_alert).state) {
+              ESP_LOGW("safety", "Xiaomi sensöründen %u dakikadır veri yok! Emniyet için kombi durduruldu.",
+                       (unsigned) timeout_dk);
+              id(sensor_timeout_alert).publish_state(true);
+              id(room_temp).publish_state(NAN);
+            }
+            id(sensor_ok) = false;
+          }
+          if (!id(sensor_ok)) {
+            // Emniyet kapatması minimum çalışma süresini beklemez.
+            if (id(kombi_role).state)
+              id(kombi_role).turn_off();
+            set_status(id(sensor_timeout_alert).state ? "HATA: Sensör bağlantısı koptu (Emniyet kapatması)"
+                                                      : "Sensör verisi bekleniyor...");
+            return;
+          }
+
+          const float temp = id(son_ham_sicaklik);
+
+          // ------------------------------------------------------------------
+          // 3. Isıtma isteği (histerezis) + kombi şalt/eşanjör koruması
+          //    Zaman damgaları rölenin on_turn_on/on_turn_off olaylarında tutulur;
+          //    HA'dan veya butondan yapılan manuel değişiklikler de korumaya dahildir.
+          // ------------------------------------------------------------------
+          const bool role = id(kombi_role).state;
+          bool istek;
+          if (kapali) {
+            // Kapalı modda yalnızca acil donma koruması: 5°C altında yak, 7°C'ye ulaşınca söndür.
+            istek = temp < KAPALI_DONMA_AC || (role && id(donma_acil) && temp < KAPALI_DONMA_KAPAT);
+          } else {
+            // Devreye girme: Hedef - Histerezis, devreden çıkma: Hedef + Histerezis
+            const float hyst = id(histerezis_toleransi).state;
+            istek = role ? (temp < hedef + hyst) : (temp < hedef - hyst);
+          }
+
+          const char *isitiyor = kapali ? "Acil Donma Koruması (Kombi Devrede)" : "Isıtıyor (Kombi Devrede)";
+          const char *bekliyor = kapali ? "Kapalı" : "Hedefe Ulaşıldı (Beklemede)";
+
+          if (istek == role) {
+            set_status(role ? isitiyor : bekliyor);
+            return;
+          }
+
+          const uint32_t min_on_ms = (uint32_t) (id(min_calisma_suresi).state * 60000.0f);
+          const uint32_t min_off_ms = (uint32_t) (id(min_bekleme_suresi).state * 60000.0f);
+          char buf[64];
+
+          if (istek) {
+            const uint32_t kapali_sure = now_ms - id(last_relay_off_time);
+            if (kapali_sure < min_off_ms) {
+              snprintf(buf, sizeof(buf), "Dinlenme Koruması (Bekleniyor: %u sn)",
+                       (unsigned) ((min_off_ms - kapali_sure) / 1000));
+              set_status(buf);
+              return;
+            }
+            ESP_LOGI("therm", "Oda %.2f °C, hedef %.2f °C -> KOMBİ DEVREDE", temp, kapali ? KAPALI_DONMA_KAPAT : hedef);
+            id(donma_acil) = kapali;
+            id(kombi_role).turn_on();
+            set_status(isitiyor);
+          } else {
+            // Kullanıcının "Kapalı"ya alması beklemeden uygulanır; diğer durumlarda
+            // eşanjörü korumak için minimum çalışma süresi doldurulur.
+            const bool hemen = kapali && !id(donma_acil);
+            const uint32_t acik_sure = now_ms - id(last_relay_on_time);
+            if (!hemen && acik_sure < min_on_ms) {
+              snprintf(buf, sizeof(buf), "Min Çalışma Koruması (%u sn)", (unsigned) ((min_on_ms - acik_sure) / 1000));
+              set_status(buf);
+              return;
+            }
+            ESP_LOGI("therm", "Oda %.2f °C -> KOMBİ KAPATILDI (%s)", temp, mod.c_str());
+            id(kombi_role).turn_off();
+            set_status(bekliyor);
+          }
+
+# ==============================================================================
+# KOMBİ RÖLESİ
+# Röle hangi kaynaktan değişirse değişsin (motor, HA, buton) zaman damgası burada
+# tutulur; böylece manuel müdahaleler de kombi koruma sürelerine dahil edilir.
+# ==============================================================================
+switch:
+  - platform: gpio
+    id: kombi_role
+    pin: GPIO13
+    name: "Kombi Rölesi"
+    icon: "mdi:radiator"
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - lambda: |-
+          id(last_relay_on_time) = millis();
+          ESP_LOGI("role", "Kombi rölesi AÇILDI");
+    on_turn_off:
+      - lambda: |-
+          id(last_relay_off_time) = millis();
+          id(donma_acil) = false;
+          ESP_LOGI("role", "Kombi rölesi KAPANDI");
+
+# ==============================================================================
+# BLE TARAYICI
+# Xiaomi sensörleri pasif yayın yapar; aktif tarama gereksizdir ve sensör pilini tüketir.
+# ==============================================================================
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 500ms
+    window: 50ms
+    active: false
+
+# ==============================================================================
+# XIAOMI SENSÖR - TEK FIRMWARE, İKİ FORMAT
+# İki bileşen aynı MAC adresini dinler; sensör hangi formatta yayın yaparsa o okunur:
+#   - pvvx_mithermometer: PVVX firmware'li sensörler (şifresiz, birkaç saniyede bir)
+#   - xiaomi_lywsd03mmc : Orijinal Xiaomi firmware (şifreli, BindKey HA'dan girilir)
+# Ham sıcaklık filtresizdir: her yayın emniyet bekçisine canlılık sinyali verir.
+# ==============================================================================
+sensor:
+  - platform: pvvx_mithermometer
+    id: pvvx_sensor
+    mac_address: ${xiaomi_mac_default}
+    temperature:
+      id: pvvx_temp
+      internal: true
+      on_value:
+        - script.execute:
+            id: sensor_veri_alindi
+            t: !lambda "return x;"
+            stok: false
+    humidity:
+      id: pvvx_hum
+      internal: true
+      on_value:
+        - lambda: "id(room_hum).publish_state(x);"
+    battery_level:
+      id: pvvx_batt
+      internal: true
+      on_value:
+        - lambda: "id(room_batt).publish_state(x);"
+    signal_strength:
+      id: room_signal
+      name: "Xiaomi Sinyal Seviyesi"
+      icon: "mdi:signal"
+      entity_category: diagnostic
+      filters:
+        - throttle: 30s
+
+  - platform: xiaomi_lywsd03mmc
+    id: stok_sensor
+    mac_address: ${xiaomi_mac_default}
+    # Yer tutucu; gerçek BindKey açılışta flash'tan (HA'dan girilen) yüklenir.
+    bindkey: "00000000000000000000000000000000"
+    temperature:
+      id: stok_temp
+      internal: true
+      on_value:
+        - script.execute:
+            id: sensor_veri_alindi
+            t: !lambda "return x;"
+            stok: true
+    humidity:
+      id: stok_hum
+      internal: true
+      on_value:
+        - lambda: "id(room_hum).publish_state(x);"
+    battery_level:
+      id: stok_batt
+      internal: true
+      on_value:
+        - lambda: "id(room_batt).publish_state(x);"
+
+  - platform: template
+    name: "Oda Nem"
+    id: room_hum
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: humidity
+    state_class: measurement
+    update_interval: never
+    filters:
+      - throttle: 15s
+      - delta: 0.5
+
+  - platform: template
+    name: "Xiaomi Sensör Pil"
+    id: room_batt
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: never
+    filters:
+      - throttle: 60s
+
+  - platform: template
+    name: "Oda Sıcaklığı"
+    id: room_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 2
+    device_class: "temperature"
+    state_class: "measurement"
+    icon: "mdi:thermometer"
+    update_interval: never
+    filters:
+      - throttle: 5s
+      - delta: 0.05
+
+  - platform: template
+    name: "Aktif Hedef Sıcaklık"
+    id: aktif_hedef_temp
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    device_class: "temperature"
+    icon: "mdi:target"
+    update_interval: never
+
+  - platform: template
+    name: "Sensör Son Veri"
+    id: sensor_son_veri
+    unit_of_measurement: "s"
+    device_class: duration
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    icon: "mdi:timer-sand"
+    update_interval: 60s
+    lambda: |-
+      if (std::isnan(id(son_ham_sicaklik))) return NAN;  // açılıştan beri hiç veri yok
+      return (float)((millis() - id(last_sensor_seen)) / 1000);
+
+  - platform: template
+    name: "Bos RAM"
+    id: free_heap_sensor
+    unit_of_measurement: "B"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      return (float)esp_get_free_heap_size();
+
+  - platform: wifi_signal
+    name: "WiFi Sinyal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Çalışma Süresi"
+    update_interval: 60s
+    entity_category: diagnostic
+
+# ==============================================================================
+# HOME ASSISTANT ARAYÜZÜNDEN GİRİLEBİLEN AYARLAR VE PROGRAM
+# Tüm ayarlar ESP32'nin flash hafızasında kalıcıdır (restore_value: true).
+# ==============================================================================
+text:
+  # Sensör MAC adresi (PVVX ve orijinal firmware için aynı alan)
+  - platform: template
+    name: "Xiaomi Sensör MAC Adresi"
+    id: xiaomi_mac_input
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: ${xiaomi_mac_default}
+    min_length: 17
+    max_length: 17
+    pattern: "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"
+    icon: "mdi:bluetooth"
+    entity_category: config
+    set_action:
+      - lambda: |-
+          uint64_t mac;
+          if (termostat_parse_mac(x, mac)) {
+            id(pvvx_sensor).set_address(mac);
+            id(stok_sensor).set_address(mac);
+            // Yeni sensörden veri gelene kadar eski sensörün değeri kullanılmasın
+            id(last_sensor_seen) = millis();
+            id(sensor_ok) = false;
+            id(son_ham_sicaklik) = NAN;
+            ESP_LOGI("mac", "Xiaomi sensör MAC adresi güncellendi: %s", x.c_str());
+          } else {
+            ESP_LOGW("mac", "Geçersiz MAC adresi formatı: %s (Örnek: A4:C1:38:C5:0D:5D)", x.c_str());
+          }
+
+  # Orijinal Xiaomi firmware BindKey'i (PVVX'te gerekmez). Yalnızca yazılabilir:
+  # kaydedildikten sonra HA'da maskelenmiş görünür.
+  - platform: template
+    name: "Xiaomi BindKey"
+    id: bindkey_input
+    mode: password
+    optimistic: false
+    max_length: 32
+    icon: "mdi:key-variant"
+    entity_category: config
+    set_action:
+      - lambda: |-
+          if (x == TERMOSTAT_MASKE)
+            return;
+          if (!termostat_valid_bindkey(x)) {
+            ESP_LOGW("bindkey", "Geçersiz BindKey: 32 hex karakter olmalı");
+            return;
+          }
+          id(xiaomi_bindkey) = termostat_upper(x);
+          id(stok_sensor).set_bindkey(id(xiaomi_bindkey));
+          id(bindkey_input).publish_state(TERMOSTAT_MASKE);
+          ESP_LOGI("bindkey", "Xiaomi BindKey kaydedildi");
+
+  # Yerel ağdan (ESPHome) firmware yükleme şifresi. Boşsa ağdaki herkes firmware
+  # yükleyebilir. Yalnızca yazılabilir; HA'da maskelenmiş görünür.
+  - platform: template
+    name: "OTA Güncelleme Şifresi"
+    id: ota_sifre_input
+    mode: password
+    optimistic: false
+    max_length: 63
+    icon: "mdi:lock"
+    entity_category: config
+    set_action:
+      - lambda: |-
+          if (x == TERMOSTAT_MASKE)
+            return;
+          if (!x.empty() && x.size() < 8) {
+            ESP_LOGW("ota", "OTA şifresi en az 8 karakter olmalı");
+            return;
+          }
+          id(ota_sifresi) = x;
+          id(esphome_ota).set_auth_password(x);
+          id(ota_sifre_input).publish_state(x.empty() ? "" : TERMOSTAT_MASKE);
+          ESP_LOGI("ota", "%s", x.empty() ? "OTA şifresi kaldırıldı" : "OTA şifresi güncellendi");
+
+select:
+  - platform: template
+    name: "Termostat Çalışma Modu"
+    id: termostat_modu
+    optimistic: true
+    restore_value: true
+    options:
+      - "Zaman Dilimi Programı (Otomatik)"
+      - "Manuel Sabit Hedef"
+      - "Donma Koruması"
+      - "Kapalı"
+    initial_option: "Zaman Dilimi Programı (Otomatik)"
+    icon: "mdi:thermostat-cog"
+    on_value:
+      - script.execute: termostat_kontrol
+
+number:
+  # --- Sabah / Uyanma Dilimi ---
+  - platform: template
+    name: "Sabah Başlangıç Saati"
+    id: sabah_saat
+    optimistic: true
+    restore_value: true
+    initial_value: 6
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "saat"
+    icon: "mdi:clock-start"
+
+  - platform: template
+    name: "Sabah Hedef Sıcaklığı"
+    id: sabah_hedef
+    optimistic: true
+    restore_value: true
+    initial_value: 23.0
+    min_value: 12.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:weather-sunset-up"
+
+  # --- Gündüz / Ekonomi Dilimi ---
+  - platform: template
+    name: "Gündüz Başlangıç Saati"
+    id: gunduz_saat
+    optimistic: true
+    restore_value: true
+    initial_value: 8
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "saat"
+    icon: "mdi:clock-outline"
+
+  - platform: template
+    name: "Gündüz Hedef Sıcaklığı"
+    id: gunduz_hedef
+    optimistic: true
+    restore_value: true
+    initial_value: 18.0
+    min_value: 12.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:weather-sunny"
+
+  # --- Akşam / Konfor Dilimi ---
+  - platform: template
+    name: "Akşam Başlangıç Saati"
+    id: aksam_saat
+    optimistic: true
+    restore_value: true
+    initial_value: 17
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "saat"
+    icon: "mdi:clock-end"
+
+  - platform: template
+    name: "Akşam Hedef Sıcaklığı"
+    id: aksam_hedef
+    optimistic: true
+    restore_value: true
+    initial_value: 23.5
+    min_value: 12.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:weather-sunset-down"
+
+  # --- Gece / Uyku Dilimi ---
+  - platform: template
+    name: "Gece Başlangıç Saati"
+    id: gece_saat
+    optimistic: true
+    restore_value: true
+    initial_value: 23
+    min_value: 0
+    max_value: 23
+    step: 1
+    unit_of_measurement: "saat"
+    icon: "mdi:clock-night"
+
+  - platform: template
+    name: "Gece Hedef Sıcaklığı"
+    id: gece_hedef
+    optimistic: true
+    restore_value: true
+    initial_value: 19.0
+    min_value: 12.0
+    max_value: 30.0
+    step: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:weather-night"
+
+  # --- Manuel ve Güvenlik Sıcaklıkları ---
+  - platform: template
+    name: "Manuel Hedef Sıcaklık"
+    id: manuel_hedef_sicaklik
+    optimistic: true
+    restore_value: true
+    min_value: 10.0
+    max_value: 30.0
+    step: 0.5
+    initial_value: 22.0
+    unit_of_measurement: "°C"
+    icon: "mdi:thermometer-chevron-up"
+    on_value:
+      - script.execute: termostat_kontrol
+
+  - platform: template
+    name: "Histerezis Toleransı"
+    id: histerezis_toleransi
+    optimistic: true
+    restore_value: true
+    min_value: 0.1
+    max_value: 2.0
+    step: 0.1
+    initial_value: 0.5
+    unit_of_measurement: "°C"
+    icon: "mdi:arrow-expand-vertical"
+
+  - platform: template
+    name: "Donma Koruma Sıcaklığı"
+    id: donma_koruma_sicakligi
+    optimistic: true
+    restore_value: true
+    min_value: 5.0
+    max_value: 15.0
+    step: 0.5
+    initial_value: 10.0
+    unit_of_measurement: "°C"
+    icon: "mdi:snowflake-alert"
+
+  # --- Kombi Donanım Koruma Süreleri (Şalt ve Eşanjör Koruması) ---
+  - platform: template
+    name: "Kombi Minimum Çalışma Süresi"
+    id: min_calisma_suresi
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 15
+    step: 1
+    initial_value: 3
+    unit_of_measurement: "dk"
+    icon: "mdi:timer-outline"
+
+  - platform: template
+    name: "Kombi Minimum Bekleme Süresi"
+    id: min_bekleme_suresi
+    optimistic: true
+    restore_value: true
+    min_value: 1
+    max_value: 15
+    step: 1
+    initial_value: 3
+    unit_of_measurement: "dk"
+    icon: "mdi:timer-off-outline"
+
+# DURUM VE TEŞHİS BİLGİLERİ (motor tarafından yalnızca değiştiğinde yayınlanır)
+text_sensor:
+  - platform: template
+    name: "Aktif Program Dilimi"
+    id: aktif_program_dilimi
+    icon: "mdi:clock-check-outline"
+    update_interval: never
+
+  - platform: template
+    name: "Termostat Çalışma Durumu"
+    id: calisma_durumu
+    icon: "mdi:fire"
+    update_interval: never
+
+  - platform: template
+    name: "Sensör Tipi"
+    id: sensor_tipi
+    icon: "mdi:chip"
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: version
+    name: "ESPHome Sürümü"
+    hide_timestamp: true
+
+# CİHAZ YÖNETİM BUTONLARI
+button:
+  - platform: restart
+    name: "Cihazı Yeniden Başlat"
+    id: yeniden_baslat
+    icon: "mdi:restart"
+
+  - platform: factory_reset
+    name: "Fabrika Ayarlarına Sıfırla"
+    id: fabrika_ayarlari
+    icon: "mdi:restore"
+
+  - platform: template
+    name: "WiFi Ayarlarını Sıfırla (Kurulum Modu)"
+    icon: "mdi:wifi-refresh"
+    on_press:
+      - logger.log: "WiFi ayarları temizleniyor ve Cihaz AP Modunda Yeniden Başlatılıyor..."
+      - lambda: |-
+          wifi::global_wifi_component->save_wifi_sta("", "");
+      - delay: 500ms
+      - button.press: yeniden_baslat
+
+# ==============================================================================
+# OTONOM KOMBİ VE TERMOSTAT KONTROL MOTORU (ESP32 İÇİNDE ÇALIŞIR)
+# ==============================================================================
+globals:
+  - id: last_sensor_seen
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: sensor_ok
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: son_ham_sicaklik
+    type: float
+    restore_value: false
+    initial_value: "NAN"
+  - id: last_relay_on_time
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: last_relay_off_time
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: motor_hazir
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: donma_acil
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: sensor_stok
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # HA'dan girilen gizli değerler (flash'ta saklanır, HA'ya geri gönderilmez)
+  - id: xiaomi_bindkey
+    type: std::string
+    restore_value: true
+    max_restore_data_length: 32
+    initial_value: '""'
+  - id: ota_sifresi
+    type: std::string
+    restore_value: true
+    max_restore_data_length: 63
+    initial_value: '""'
+  # Home Assistant'tan gelen son saat dilimi (POSIX TZ biçiminde)
+  - id: ha_saat_dilimi
+    type: std::string
+    restore_value: true
+    max_restore_data_length: 63
+    initial_value: '""'
+  - id: led_blink
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+interval:
+  - interval: 10s
+    then:
+      - script.execute: termostat_kontrol
+
+  # HA'nın gönderdiği saat dilimi yalnızca ha_time'a yazılır; SNTP her senkronda kendi
+  # dilimini geri yüklediği için aynı dilim SNTP'ye de uygulanır ve flash'a kaydedilir.
+  - interval: 60s
+    then:
+      - lambda: |-
+          const std::string tz = id(ha_time).get_timezone();
+          if (tz.empty() || tz.size() > 63 || tz == id(my_time).get_timezone())
+            return;
+          id(my_time).set_timezone(tz);
+          id(ha_saat_dilimi) = tz;
+          ESP_LOGI("time", "Saat dilimi Home Assistant'tan alındı: %s", tz.c_str());
+
+  # Durum LED'i: Wi-Fi yoksa yanıp söner, bağlıyken kombi rölesinin durumunu gösterir.
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(button_hold_feedback).is_running())
+            return;
+          bool on;
+          if (!wifi::global_wifi_component->is_connected()) {
+            id(led_blink) = !id(led_blink);
+            on = id(led_blink);
+          } else {
+            on = id(kombi_role).state;
+          }
+          id(led_gpio).set_state(on);
+

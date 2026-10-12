@@ -1,0 +1,51 @@
+name: Sürüm Yayınla
+
+# "v1.2.0" gibi bir etiket gönderildiğinde firmware derlenir ve GitHub Releases'e eklenir:
+#   - esp32-xiaomi-termostat.factory.bin : ilk kurulum (web flasher / esptool, adres 0x0)
+#   - esp32-xiaomi-termostat.ota.bin     : ağ üzerinden (ESPHome OTA) güncelleme dosyası
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  NAME: esp32-xiaomi-termostat
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Kontrol motoru testleri
+        run: python tests/run_engine_tests.py
+
+      - name: Derle
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          esphome \
+            -s version "$VERSION" \
+            -s github_owner "${{ github.repository_owner }}" \
+            compile termostat.yaml
+
+      - name: Dosyaları hazırla
+        run: |
+          BUILD=".esphome/build/${NAME}/.pioenvs/${NAME}"
+          mkdir -p dist
+          cp "$BUILD/firmware.factory.bin" "dist/${NAME}.factory.bin"
+          cp "$BUILD/firmware.ota.bin" "dist/${NAME}.ota.bin"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

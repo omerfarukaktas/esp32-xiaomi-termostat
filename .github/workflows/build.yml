@@ -1,0 +1,37 @@
+name: Derleme ve Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Kontrol motoru testleri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - run: python tests/run_engine_tests.py
+
+  build:
+    name: Firmware derleme
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('requirements.txt') }}-${{ hashFiles('termostat.yaml') }}
+          restore-keys: pio-${{ hashFiles('requirements.txt') }}-
+      - run: pip install -r requirements.txt
+      - run: esphome config termostat.yaml
+      - run: esphome compile termostat.yaml

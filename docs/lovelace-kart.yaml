@@ -1,0 +1,107 @@
+# Home Assistant için hazır termostat panosu (görünüm).
+#
+# Kurulum (ayrıntılar README'de "Pano Kartı" bölümünde):
+#   Ayarlar > Panolar > Pano Ekle > "Sıfırdan yeni pano" > adı "Termostat"
+#   Panoyu açın > sağ üstte kalem (Düzenle) > ⋮ > Ham yapılandırma düzenleyici
+#   İçeriği silip bu dosyanın tamamını yapıştırın > Kaydet.
+#
+# Varlık adları, cihazın Home Assistant'a "ESP32 Xiaomi Termostat" adıyla ilk kez
+# eklendiği durumdakidir. Sizde farklıysa (cihazı daha önce başka adla eklediyseniz)
+# "esp32_xiaomi_termostat_" önekini kendi önekinizle değiştirin.
+title: Termostat
+views:
+  - title: Termostat
+    path: termostat
+    icon: mdi:thermostat
+    cards:
+      # Anlık durum ve son 24 saatin grafiği
+      - type: vertical-stack
+        cards:
+          - type: glance
+            title: Kombi Termostat
+            entities:
+              - entity: sensor.esp32_xiaomi_termostat_oda_sicakligi
+                name: Sıcaklık
+              - entity: sensor.esp32_xiaomi_termostat_aktif_hedef_sicaklik
+                name: Hedef
+              - entity: sensor.esp32_xiaomi_termostat_oda_nem
+                name: Nem
+          - type: history-graph
+            title: Son 24 saat
+            hours_to_show: 24
+            entities:
+              - entity: sensor.esp32_xiaomi_termostat_oda_sicakligi
+                name: Oda
+              - entity: sensor.esp32_xiaomi_termostat_aktif_hedef_sicaklik
+                name: Hedef
+              - entity: switch.esp32_xiaomi_termostat_kombi_rolesi
+                name: Kombi
+
+      # Mod ve hedefler
+      - type: entities
+        title: Çalışma
+        entities:
+          - entity: select.esp32_xiaomi_termostat_termostat_calisma_modu
+            name: Mod
+          - entity: sensor.esp32_xiaomi_termostat_aktif_program_dilimi
+            name: Aktif Dilim
+          - entity: sensor.esp32_xiaomi_termostat_termostat_calisma_durumu
+            name: Durum
+          - entity: number.esp32_xiaomi_termostat_manuel_hedef_sicaklik
+            name: Manuel Hedef
+          - entity: number.esp32_xiaomi_termostat_donma_koruma_sicakligi
+            name: Donma Koruma
+          - entity: binary_sensor.esp32_xiaomi_termostat_sensor_baglanti_uyarisi
+            name: Sensör Uyarısı
+
+      # 4 dilimli zaman programı
+      - type: entities
+        title: Zaman Programı
+        entities:
+          - type: section
+            label: Sabah
+          - entity: number.esp32_xiaomi_termostat_sabah_baslangic_saati
+            name: Başlangıç
+          - entity: number.esp32_xiaomi_termostat_sabah_hedef_sicakligi
+            name: Hedef
+          - type: section
+            label: Gündüz
+          - entity: number.esp32_xiaomi_termostat_gunduz_baslangic_saati
+            name: Başlangıç
+          - entity: number.esp32_xiaomi_termostat_gunduz_hedef_sicakligi
+            name: Hedef
+          - type: section
+            label: Akşam
+          - entity: number.esp32_xiaomi_termostat_aksam_baslangic_saati
+            name: Başlangıç
+          - entity: number.esp32_xiaomi_termostat_aksam_hedef_sicakligi
+            name: Hedef
+          - type: section
+            label: Gece
+          - entity: number.esp32_xiaomi_termostat_gece_baslangic_saati
+            name: Başlangıç
+          - entity: number.esp32_xiaomi_termostat_gece_hedef_sicakligi
+            name: Hedef
+
+      # Kombi koruma ayarları ve sensör/cihaz teşhisi
+      - type: entities
+        title: Ayarlar ve Teşhis
+        entities:
+          - entity: number.esp32_xiaomi_termostat_histerezis_toleransi
+            name: Histerezis
+          - entity: number.esp32_xiaomi_termostat_kombi_minimum_calisma_suresi
+            name: Min. Çalışma
+          - entity: number.esp32_xiaomi_termostat_kombi_minimum_bekleme_suresi
+            name: Min. Bekleme
+          - entity: sensor.esp32_xiaomi_termostat_xiaomi_sensor_pil
+            name: Sensör Pili
+          - entity: sensor.esp32_xiaomi_termostat_xiaomi_sinyal_seviyesi
+            name: Sensör Sinyali
+          - entity: sensor.esp32_xiaomi_termostat_sensor_son_veri
+            name: Son Veri
+          - entity: sensor.esp32_xiaomi_termostat_sensor_tipi
+            name: Sensör Tipi
+          - entity: sensor.esp32_xiaomi_termostat_wifi_sinyal
+            name: WiFi Sinyal
+          - entity: sensor.esp32_xiaomi_termostat_calisma_suresi
+            name: Çalışma Süresi
